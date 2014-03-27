@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 )
-
+// written by wayman tan
 type libstore struct {
 	mode                 LeaseMode
 	masterServerHostPort string
