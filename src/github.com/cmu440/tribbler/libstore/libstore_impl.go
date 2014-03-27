@@ -52,6 +52,8 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		myHostPort:           myHostPort,
 		serverList:           list.New(),
 		connMap:              make(map[string]*rpc.Client),
+		serverListLock:       new(sync.Mutex),
+		connMapLock:          new(sync.Mutex),
 	}
 
 	//register to master
@@ -85,11 +87,9 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	if i >= 5 {
 		return nil, errors.New("Fail to connect storage server")
 	}
-
 	if mode != Never {
 		rpc.RegisterName("LeaseCallbacks", librpc.Wrap(ls))
 	}
-
 	return ls, nil
 }
 
@@ -235,8 +235,7 @@ func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storage
 
 func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
 	keyHash := StoreHash(key)
-
-	var serverHostPort string
+	serverHostPort := ""
 	var serverID uint32
 	serverID = 1<<32 - 1
 	ls.serverListLock.Lock()
@@ -246,6 +245,9 @@ func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
 			serverID = node.NodeID
 			serverHostPort = node.HostPort
 		}
+	}
+	if serverHostPort == "" {
+		serverHostPort = ls.serverList.Front().Value.(storagerpc.Node).HostPort
 	}
 	ls.serverListLock.Unlock()
 

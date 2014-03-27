@@ -2,13 +2,14 @@ package storageserver
 
 import (
 	"container/list"
-	"fmt"
+	"github.com/cmu440/tribbler/common"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"hash/fnv"
 	"net"
 	"net/http"
 	"net/rpc"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,7 +56,6 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		rpc.HandleHTTP()
 		l, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 		if err != nil {
-			fmt.Println(err)
 			return nil, err
 		}
 		go http.Serve(l, nil)
@@ -67,16 +67,18 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		if err != nil {
 			return nil, err
 		}
-		args := &storagerpc.RegisterArgs{*&storagerpc.Node{"localhost:" + string(srv.port), srv.serverID}}
+		args := &storagerpc.RegisterArgs{*&storagerpc.Node{"localhost:" + strconv.Itoa(srv.port), srv.serverID}}
 		var reply *storagerpc.RegisterReply
 		err = client.Call("storageServer.RegisterServer", args, &reply)
 		if err != nil {
 			return nil, err
 		}
 		if reply.Status == storagerpc.OK {
+			srv.serverList = list.New()
 			for _, node := range reply.Servers {
 				srv.serverList.PushBack(node)
 			}
+			break
 		}
 		time.Sleep(time.Duration(1) * time.Second)
 	}
@@ -147,7 +149,7 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	ss.serverListLock.Unlock()
 
 	key := args.Key
-	if ss.serverID < StoreHash(key) {
+	if !ss.validServer(StoreHash(key)) {
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
@@ -183,7 +185,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	reply.Status = storagerpc.OK
 
 	key := args.Key
-	if ss.serverID < StoreHash(key) {
+	if !ss.validServer(StoreHash(key)) {
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
@@ -191,7 +193,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	ss.listMapLock.Lock()
 	list, ok := ss.listMap[key]
 	if !ok {
-		ss.elementMapLock.Unlock()
+		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	}
@@ -215,7 +217,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	key := args.Key
-	if ss.serverID < StoreHash(key) {
+	if !ss.validServer(StoreHash(key)) {
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
@@ -235,66 +237,137 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	key := args.Key
-	if ss.serverID < StoreHash(key) {
+	if !ss.validServer(StoreHash(key)) {
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
-
-	ss.elementMapLock.Lock()
-	if l, ok := ss.listMap[key]; ok { // There is already a list for that key
-		var value string
-		for e := l.Front(); e != nil; e = e.Next() {
-			value = e.Value.(string)
-			if value == args.Value {
-				ss.elementMapLock.Unlock()
-				reply.Status = storagerpc.ItemExists
-				return nil
+	suffix := strings.Split(key, ":")[1]
+	if suffix == "tribbleList" {
+		ss.listMapLock.Lock()
+		if l, ok := ss.listMap[key]; ok { // There is already a list for that key
+			var value string
+			for e := l.Front(); e != nil; e = e.Next() {
+				value = e.Value.(string) // <User_id>:<Posted>
+				if value == args.Value {
+					ss.listMapLock.Unlock()
+					reply.Status = storagerpc.ItemExists
+					return nil
+				}
+				if after(args.Value, value) { // A newer tribble
+					ss.listMap[key].InsertBefore(args.Value, e)
+					ss.listMapLock.Unlock()
+					reply.Status = storagerpc.OK
+					return nil
+				}
 			}
+			//Oldest tribble should be put last of list
+			ss.listMap[key].PushBack(args.Value)
+			ss.listMapLock.Unlock()
+			reply.Status = storagerpc.OK
+			return nil
+		} else { // No key list exist before
+			ss.listMap[key] = list.New()
+			ss.listMap[key].PushFront(args.Value)
+			ss.listMapLock.Unlock()
+			reply.Status = storagerpc.OK
+			return nil
 		}
-		ss.listMap[key].PushFront(args.Value)
-		ss.elementMapLock.Unlock()
-		reply.Status = storagerpc.OK
-		return nil
-	} else { // No key list exist before
-		ss.listMap[key] = list.New()
-		ss.listMap[key].PushFront(args.Value)
-		ss.elementMapLock.Unlock()
-		reply.Status = storagerpc.OK
-		return nil
+	} else { // It's a request for subscriptions
+		ss.listMapLock.Lock()
+		if l, ok := ss.listMap[key]; ok { // There is already a list for that key
+			var value string
+			for e := l.Front(); e != nil; e = e.Next() {
+				value = e.Value.(string)
+				if value == args.Value {
+					ss.listMapLock.Unlock()
+					reply.Status = storagerpc.ItemExists
+					return nil
+				}
+			}
+			ss.listMap[key].PushFront(args.Value)
+			ss.listMapLock.Unlock()
+			reply.Status = storagerpc.OK
+			return nil
+		} else { // No key list exist before
+			ss.listMap[key] = list.New()
+			ss.listMap[key].PushFront(args.Value)
+			ss.listMapLock.Unlock()
+			reply.Status = storagerpc.OK
+			return nil
+		}
 	}
+
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	key := args.Key
-	if ss.serverID < StoreHash(key) {
+	if !ss.validServer(StoreHash(key)) {
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
 
-	ss.elementMapLock.Lock()
+	ss.listMapLock.Lock()
 	if l, ok := ss.listMap[key]; ok { // There is already a list for that key
 		var value string
 		for e := l.Front(); e != nil; e = e.Next() {
 			value = e.Value.(string)
 			if value == args.Value {
 				l.Remove(e)
-				ss.elementMapLock.Unlock()
+				ss.listMapLock.Unlock()
 				reply.Status = storagerpc.OK
 				return nil
 			}
 		}
-		ss.elementMapLock.Unlock()
+		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	} else { // No key list exist
-		ss.elementMapLock.Unlock()
+		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	}
 }
 
 func StoreHash(key string) uint32 {
+
+	strs := strings.Split(key, ":")
+	userID := strs[0]
 	hasher := fnv.New32()
-	hasher.Write([]byte(key))
+	hasher.Write([]byte(userID))
 	return hasher.Sum32()
+}
+
+func (ss *storageServer) validServer(keyHash uint32) bool {
+	var serverID uint32
+	serverID = 1<<32 - 1
+	ss.serverListLock.Lock()
+	for e := ss.serverList.Front(); e != nil; e = e.Next() {
+		node := e.Value.(storagerpc.Node)
+		if node.NodeID >= keyHash && node.NodeID < serverID {
+			serverID = node.NodeID
+		}
+	}
+	if serverID == 1<<32-1 {
+		serverID = ss.serverList.Front().Value.(storagerpc.Node).NodeID
+	}
+	if serverID == ss.serverID {
+		ss.serverListLock.Unlock()
+		return true
+	} else {
+		ss.serverListLock.Unlock()
+		return false
+	}
+
+}
+
+func after(tribbleIDOne, tribbleIDTwo string) bool {
+	strOne := strings.Split(tribbleIDOne, ":")
+	strTwo := strings.Split(tribbleIDOne, ":")
+	timeOne, _ := time.Parse(common.Layout, strOne[1])
+	timeTwo, _ := time.Parse(common.Layout, strTwo[1])
+	if timeOne.After(timeTwo) {
+		return true
+	} else {
+		return false
+	}
 }
