@@ -16,9 +16,9 @@ type libstore struct {
 	myHostPort           string
 	serverList           *list.List
 	serverListLock       *sync.Mutex
-
-	connMap     map[string]*rpc.Client
-	connMapLock *sync.Mutex
+	leaseMap             map[string]*rpc.Client
+	connMap              map[string]*rpc.Client
+	connMapLock          *sync.Mutex
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -65,7 +65,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		}
 		args := &storagerpc.GetServersArgs{}
 		var reply *storagerpc.GetServersReply
-		err = client.Call("storageServer.GetServers", args, &reply)
+		err = client.Call("StorageServer.GetServers", args, &reply)
 		if err != nil {
 			return nil, err
 		}
@@ -109,7 +109,7 @@ func (ls *libstore) Get(key string) (string, error) {
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
 	var reply *storagerpc.GetReply
-	err = client.Call("storageServer.Get", args, &reply)
+	err = client.Call("StorageServer.Get", args, &reply)
 	if err != nil {
 		return "", err
 	}
@@ -135,7 +135,7 @@ func (ls *libstore) Put(key, value string) error {
 	}
 	args := &storagerpc.PutArgs{key, value}
 	var reply *storagerpc.PutReply
-	err = client.Call("storageServer.Put", args, &reply)
+	err = client.Call("StorageServer.Put", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -148,6 +148,7 @@ func (ls *libstore) Put(key, value string) error {
 	} else {
 		return errors.New("Fail to put " + key + "into storageserver")
 	}
+	return nil
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
@@ -166,7 +167,7 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
 	var reply *storagerpc.GetListReply
-	err = client.Call("storageServer.GetList", args, &reply)
+	err = client.Call("StorageServer.GetList", args, &reply)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +193,7 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	}
 	args := &storagerpc.PutArgs{key, removeItem}
 	var reply *storagerpc.PutReply
-	err = client.Call("storageServer.RemoveFromList", args, &reply)
+	err = client.Call("StorageServer.RemoveFromList", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -214,7 +215,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	}
 	args := &storagerpc.PutArgs{key, newItem}
 	var reply *storagerpc.PutReply
-	err = client.Call("storageServer.AppendToList", args, &reply)
+	err = client.Call("StorageServer.AppendToList", args, &reply)
 	if err != nil {
 		return err
 	}

@@ -20,12 +20,22 @@ type storageServer struct {
 	port                 int
 	masterServerHostPort string
 	serverList           *list.List
-	serverListLock       *sync.Mutex
 
 	elementMap     map[string]string
 	elementMapLock *sync.Mutex
 	listMap        map[string]*list.List
 	listMapLock    *sync.Mutex
+
+	EleaseMap     map[string]*list.List
+	EleaseMapLock *sync.Mutex
+
+	LleaseMap     map[string]*list.List
+	LleaseMapLock *sync.Mutex
+}
+
+type leaseInfo struct {
+	HostPort  string
+	GrantTime time.Time
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -43,16 +53,19 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		numNodes:             numNodes,
 		masterServerHostPort: masterServerHostPort,
 		serverList:           list.New(),
-		serverListLock:       new(sync.Mutex),
 		listMap:              make(map[string]*list.List),
 		listMapLock:          new(sync.Mutex),
 		elementMap:           make(map[string]string),
 		elementMapLock:       new(sync.Mutex),
+		EleaseMap:            make(map[string]*list.List),
+		EleaseMapLock:        new(sync.Mutex),
+		LleaseMap:            make(map[string]*list.List),
+		LleaseMapLock:        new(sync.Mutex),
 	}
 	if srv.masterServerHostPort == "" {
 		// run RPC server
 		srv.masterServerHostPort = "localhost:" + strconv.Itoa(port)
-		rpc.RegisterName("storageServer", srv)
+		rpc.RegisterName("StorageServer", srv)
 		rpc.HandleHTTP()
 		l, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 		if err != nil {
@@ -69,7 +82,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		}
 		args := &storagerpc.RegisterArgs{*&storagerpc.Node{"localhost:" + strconv.Itoa(srv.port), srv.serverID}}
 		var reply *storagerpc.RegisterReply
-		err = client.Call("storageServer.RegisterServer", args, &reply)
+		err = client.Call("StorageServer.RegisterServer", args, &reply)
 		if err != nil {
 			return nil, err
 		}
@@ -88,7 +101,6 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
 	node := args.ServerInfo
 	found := false
-	ss.serverListLock.Lock()
 	for e := ss.serverList.Front(); e != nil; e = e.Next() {
 		if e.Value.(storagerpc.Node) == node {
 			found = true
@@ -105,12 +117,10 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 			slice[i] = e.Value.(storagerpc.Node)
 			i++
 		}
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.OK
 		reply.Servers = slice
 		return nil
 	} else {
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.NotReady
 		reply.Servers = nil
 		return nil
@@ -118,9 +128,7 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
-	ss.serverListLock.Lock()
 	if ss.serverList.Len() < ss.numNodes {
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.NotReady
 		reply.Servers = nil
 		return nil
@@ -131,7 +139,6 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 			slice[i] = e.Value.(storagerpc.Node)
 			i++
 		}
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.OK
 		reply.Servers = slice
 		return nil
@@ -139,14 +146,11 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
-	ss.serverListLock.Lock()
 	if ss.serverList.Len() < ss.numNodes {
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.NotReady
 		reply.Value = ""
 		return nil
 	}
-	ss.serverListLock.Unlock()
 
 	key := args.Key
 	if !ss.validServer(StoreHash(key)) {
@@ -158,30 +162,67 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	value, ok := ss.elementMap[key]
 	if !ok {
 		ss.elementMapLock.Unlock()
-		reply.Status = storagerpc.ItemNotFound
+		reply.Status = storagerpc.KeyNotFound
 		return nil
 	}
-
 	ss.elementMapLock.Unlock()
 	reply.Status = storagerpc.OK
 	reply.Value = value
 
+	needGrant := false
 	if args.WantLease == true {
-		//TODO: grant a lease
+		ss.EleaseMapLock.Lock()
+		_, ok := ss.EleaseMap[key]
+		ss.EleaseMapLock.Unlock()
+
+		if !ok {
+			leaseinfo := new(leaseInfo)
+			leaseinfo.GrantTime = time.Now()
+			leaseinfo.HostPort = args.HostPort
+			ss.EleaseMapLock.Lock()
+			ss.EleaseMap[key] = list.New()
+			ss.EleaseMap[key].PushFront(leaseinfo)
+			ss.EleaseMapLock.Unlock()
+			needGrant = true
+
+		} else {
+			ss.EleaseMapLock.Lock()
+			for e := ss.EleaseMap[key].Front(); e != nil; e = e.Next() {
+				leaseinfo := e.Value.(*leaseInfo)
+				if leaseinfo.HostPort == args.HostPort && time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+					needGrant = true
+					ss.EleaseMap[key].Remove(e)
+					ss.EleaseMapLock.Unlock()
+					break
+				}
+			}
+			ss.EleaseMapLock.Unlock()
+		}
+		if needGrant {
+			ss.EleaseMapLock.Lock()
+			ss.EleaseMap[key].PushBack(&leaseInfo{args.HostPort, time.Now()})
+			ss.EleaseMapLock.Unlock()
+			lease := new(storagerpc.Lease)
+			lease.Granted = true
+			lease.ValidSeconds = storagerpc.LeaseSeconds
+			reply.Lease = *lease
+		} else {
+			lease := new(storagerpc.Lease)
+			lease.Granted = false
+			lease.ValidSeconds = storagerpc.LeaseSeconds
+			reply.Lease = *lease
+		}
 	}
 
 	return nil
 }
 
 func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
-	ss.serverListLock.Lock()
 	if ss.serverList.Len() < ss.numNodes {
-		ss.serverListLock.Unlock()
 		reply.Status = storagerpc.NotReady
 		reply.Value = nil
 		return nil
 	}
-	ss.serverListLock.Unlock()
 	reply.Status = storagerpc.OK
 
 	key := args.Key
@@ -191,25 +232,82 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	}
 
 	ss.listMapLock.Lock()
-	list, ok := ss.listMap[key]
+	l, ok := ss.listMap[key]
+	ss.listMapLock.Unlock()
 	if !ok {
-		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	}
 
-	slice := make([]string, list.Len())
+	slice := make([]string, l.Len())
 	i := 0
-	for e := list.Front(); e != nil; e = e.Next() {
+	for e := l.Front(); e != nil; e = e.Next() {
 		value := e.Value.(string)
 		slice[i] = value
 		i++
 	}
 
-	ss.listMapLock.Unlock()
 	reply.Value = slice
+	needGrant := false
 	if args.WantLease == true {
-		//TODO: grant a lease
+		//fmt.Println("Grant a new lease for key", key)
+		//lease := new(storagerpc.Lease)
+		//lease.Granted = true
+		//lease.ValidSeconds = storagerpc.LeaseSeconds
+		//reply.Lease = *lease
+
+		//leaseinfo := new(leaseInfo)
+		//leaseinfo.GrantTime = time.Now()
+		//leaseinfo.HostPort = args.HostPort
+
+		//ss.LleaseMapLock.Lock()
+		//if _, ok := ss.LleaseMap[key]; !ok {
+		//	ss.LleaseMap[key] = list.New()
+		//}
+		//ss.LleaseMap[key].PushFront(leaseinfo)
+		//ss.LleaseMapLock.Unlock()
+		//return nil
+		ss.LleaseMapLock.Lock()
+		_, ok := ss.LleaseMap[key]
+		ss.LleaseMapLock.Unlock()
+
+		if !ok {
+			leaseinfo := new(leaseInfo)
+			leaseinfo.GrantTime = time.Now()
+			leaseinfo.HostPort = args.HostPort
+			ss.LleaseMapLock.Lock()
+			ss.LleaseMap[key] = list.New()
+			ss.LleaseMap[key].PushFront(leaseinfo)
+			ss.LleaseMapLock.Unlock()
+			needGrant = true
+
+		} else {
+			ss.LleaseMapLock.Lock()
+			for e := ss.LleaseMap[key].Front(); e != nil; e = e.Next() {
+				leaseinfo := e.Value.(*leaseInfo)
+				if leaseinfo.HostPort == args.HostPort && time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+					needGrant = true
+					ss.LleaseMap[key].Remove(e)
+					ss.LleaseMapLock.Unlock()
+					break
+				}
+			}
+			ss.LleaseMapLock.Unlock()
+		}
+		if needGrant {
+			ss.LleaseMapLock.Lock()
+			ss.LleaseMap[key].PushBack(&leaseInfo{args.HostPort, time.Now()})
+			ss.LleaseMapLock.Unlock()
+			lease := new(storagerpc.Lease)
+			lease.Granted = true
+			lease.ValidSeconds = storagerpc.LeaseSeconds
+			reply.Lease = *lease
+		} else {
+			lease := new(storagerpc.Lease)
+			lease.Granted = false
+			lease.ValidSeconds = storagerpc.LeaseSeconds
+			reply.Lease = *lease
+		}
 	}
 
 	return nil
@@ -222,17 +320,39 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 		return nil
 	}
 	value := args.Value
-	ss.elementMapLock.Lock()
-	if _, ok := ss.elementMap[key]; ok {
-		ss.elementMapLock.Unlock()
-		reply.Status = storagerpc.ItemExists
-		return nil
-	} else {
-		ss.elementMap[key] = value
-		ss.elementMapLock.Unlock()
-		reply.Status = storagerpc.OK
-		return nil
+
+	//Revoke all leases for this key
+	ss.EleaseMapLock.Lock()
+	l, ok := ss.EleaseMap[key]
+	ss.EleaseMapLock.Unlock()
+	if ok {
+		for e := l.Front(); e != nil; e = e.Next() {
+			leaseinfo := e.Value.(*leaseInfo)
+			if time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				continue
+			}
+			//Send revoke message and wait for reply.
+			client, err := rpc.DialHTTP("tcp", leaseinfo.HostPort)
+			if err != nil {
+				continue
+			}
+			args := &storagerpc.RevokeLeaseArgs{key}
+			var reply *storagerpc.RevokeLeaseReply
+			for time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				go client.Call("LeaseCallbacks.RevokeLease", args, &reply)
+				time.Sleep(time.Duration(1) * time.Second)
+			}
+		}
+		ss.EleaseMapLock.Lock()
+		delete(ss.EleaseMap, key)
+		ss.EleaseMapLock.Unlock()
 	}
+
+	ss.elementMapLock.Lock()
+	ss.elementMap[key] = value
+	ss.elementMapLock.Unlock()
+	reply.Status = storagerpc.OK
+	return nil
 }
 
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
@@ -241,19 +361,25 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 		reply.Status = storagerpc.WrongServer
 		return nil
 	}
+
+	//Revoke all leases for this key
+	ss.revokeKey(key)
+
 	suffix := strings.Split(key, ":")[1]
 	if suffix == "tribbleList" {
 		ss.listMapLock.Lock()
-		if l, ok := ss.listMap[key]; ok { // There is already a list for that key
+		l, ok := ss.listMap[key]
+		ss.listMapLock.Unlock()
+		if ok { // There is already a list for that key
 			var value string
 			for e := l.Front(); e != nil; e = e.Next() {
 				value = e.Value.(string) // <User_id>:<Posted>
 				if value == args.Value {
-					ss.listMapLock.Unlock()
 					reply.Status = storagerpc.ItemExists
 					return nil
 				}
 				if after(args.Value, value) { // A newer tribble
+					ss.listMapLock.Lock()
 					ss.listMap[key].InsertBefore(args.Value, e)
 					ss.listMapLock.Unlock()
 					reply.Status = storagerpc.OK
@@ -261,11 +387,13 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 				}
 			}
 			//Oldest tribble should be put last of list
+			ss.listMapLock.Lock()
 			ss.listMap[key].PushBack(args.Value)
 			ss.listMapLock.Unlock()
 			reply.Status = storagerpc.OK
 			return nil
 		} else { // No key list exist before
+			ss.listMapLock.Lock()
 			ss.listMap[key] = list.New()
 			ss.listMap[key].PushFront(args.Value)
 			ss.listMapLock.Unlock()
@@ -274,21 +402,24 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 		}
 	} else { // It's a request for subscriptions
 		ss.listMapLock.Lock()
-		if l, ok := ss.listMap[key]; ok { // There is already a list for that key
+		l, ok := ss.listMap[key]
+		ss.listMapLock.Unlock()
+		if ok { // There is already a list for that key
 			var value string
 			for e := l.Front(); e != nil; e = e.Next() {
 				value = e.Value.(string)
 				if value == args.Value {
-					ss.listMapLock.Unlock()
 					reply.Status = storagerpc.ItemExists
 					return nil
 				}
 			}
+			ss.listMapLock.Lock()
 			ss.listMap[key].PushFront(args.Value)
 			ss.listMapLock.Unlock()
 			reply.Status = storagerpc.OK
 			return nil
 		} else { // No key list exist before
+			ss.listMapLock.Lock()
 			ss.listMap[key] = list.New()
 			ss.listMap[key].PushFront(args.Value)
 			ss.listMapLock.Unlock()
@@ -307,22 +438,24 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	}
 
 	ss.listMapLock.Lock()
-	if l, ok := ss.listMap[key]; ok { // There is already a list for that key
+	l, ok := ss.listMap[key]
+	ss.listMapLock.Unlock()
+	if ok { // There is already a list for that key
 		var value string
 		for e := l.Front(); e != nil; e = e.Next() {
 			value = e.Value.(string)
 			if value == args.Value {
+				ss.revokeKey(key)
+				ss.listMapLock.Lock()
 				l.Remove(e)
 				ss.listMapLock.Unlock()
 				reply.Status = storagerpc.OK
 				return nil
 			}
 		}
-		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	} else { // No key list exist
-		ss.listMapLock.Unlock()
 		reply.Status = storagerpc.ItemNotFound
 		return nil
 	}
@@ -338,24 +471,55 @@ func StoreHash(key string) uint32 {
 }
 
 func (ss *storageServer) validServer(keyHash uint32) bool {
-	var serverID uint32
+	var serverID, minID uint32
 	serverID = 1<<32 - 1
-	ss.serverListLock.Lock()
+	minID = 1<<32 - 1
 	for e := ss.serverList.Front(); e != nil; e = e.Next() {
 		node := e.Value.(storagerpc.Node)
 		if node.NodeID >= keyHash && node.NodeID < serverID {
 			serverID = node.NodeID
 		}
+		if minID > node.NodeID {
+			minID = node.NodeID
+		}
 	}
 	if serverID == 1<<32-1 {
-		serverID = ss.serverList.Front().Value.(storagerpc.Node).NodeID
+		serverID = minID
 	}
 	if serverID == ss.serverID {
-		ss.serverListLock.Unlock()
 		return true
 	} else {
-		ss.serverListLock.Unlock()
 		return false
+	}
+
+}
+
+func (ss *storageServer) revokeKey(key string) {
+	ss.LleaseMapLock.Lock()
+	l, ok := ss.LleaseMap[key]
+	ss.LleaseMapLock.Unlock()
+	if ok {
+		for e := l.Front(); e != nil; e = e.Next() {
+			leaseinfo := e.Value.(*leaseInfo)
+			if time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				continue
+			}
+			//Send revoke message and wait for reply.
+			client, err := rpc.DialHTTP("tcp", leaseinfo.HostPort)
+			if err != nil {
+				continue
+			}
+			args := &storagerpc.RevokeLeaseArgs{key}
+			var reply *storagerpc.RevokeLeaseReply
+			for time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				go client.Call("LeaseCallbacks.RevokeLease", args, &reply)
+				time.Sleep(time.Duration(1) * time.Second)
+			}
+
+		}
+		ss.LleaseMapLock.Lock()
+		delete(ss.LleaseMap, key)
+		ss.LleaseMapLock.Unlock()
 	}
 
 }
