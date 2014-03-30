@@ -6,6 +6,7 @@ import (
 	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"net/rpc"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,9 +17,30 @@ type libstore struct {
 	myHostPort           string
 	serverList           *list.List
 	serverListLock       *sync.Mutex
-	leaseMap             map[string]*rpc.Client
-	connMap              map[string]*rpc.Client
-	connMapLock          *sync.Mutex
+
+	connMap         map[string]*rpc.Client
+	connMapLock     *sync.Mutex
+	requestsMap     map[string]map[time.Time]int
+	requestsMapLock *sync.Mutex
+
+	listRequestsMap     map[string]map[time.Time]int
+	listRequestsMapLock *sync.Mutex
+	ECacheMap           map[string]*ECache
+	ECacheMapLock       *sync.Mutex
+	LCacheMap           map[string]*LCache
+	LCacheMapLock       *sync.Mutex
+}
+
+type ECache struct {
+	value       string
+	timeGranted time.Time
+	validSecond int
+}
+
+type LCache struct {
+	value       []string
+	timeGranted time.Time
+	validSecond int
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -51,9 +73,18 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		masterServerHostPort: masterServerHostPort,
 		myHostPort:           myHostPort,
 		serverList:           list.New(),
-		connMap:              make(map[string]*rpc.Client),
 		serverListLock:       new(sync.Mutex),
+		connMap:              make(map[string]*rpc.Client),
 		connMapLock:          new(sync.Mutex),
+
+		requestsMap:         make(map[string]map[time.Time]int),
+		requestsMapLock:     new(sync.Mutex),
+		listRequestsMap:     make(map[string]map[time.Time]int),
+		listRequestsMapLock: new(sync.Mutex),
+		ECacheMap:           make(map[string]*ECache),
+		ECacheMapLock:       new(sync.Mutex),
+		LCacheMap:           make(map[string]*LCache),
+		LCacheMapLock:       new(sync.Mutex),
 	}
 
 	//register to master
@@ -89,6 +120,8 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	}
 	if mode != Never {
 		rpc.RegisterName("LeaseCallbacks", librpc.Wrap(ls))
+		go ls.cleaningECache()
+		go ls.cleaningLCache()
 	}
 	return ls, nil
 }
@@ -98,13 +131,49 @@ func (ls *libstore) Get(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// Check if something in the cache
+	ls.ECacheMapLock.Lock()
+	cacheResult, ok := ls.ECacheMap[key]
+	ls.ECacheMapLock.Unlock()
+	if ok {
+		if time.Since(cacheResult.timeGranted).Seconds() > float64(cacheResult.validSecond) {
+			ls.ECacheMapLock.Lock()
+			delete(ls.ECacheMap, key)
+			ls.ECacheMapLock.Unlock()
+		} else {
+			return cacheResult.value, nil
+		}
+
+	}
+
 	wantlease := false
 	if ls.mode == Never {
 		wantlease = false
 	} else if ls.mode == Always {
 		wantlease = true
 	} else {
-		//TODO: Judge whether wantlease is true or false
+		// Put this request into requestsMap
+		ls.requestsMapLock.Lock()
+		_, ok := ls.requestsMap[key]
+		if !ok { //No such request before
+			ls.requestsMap[key] = make(map[time.Time]int)
+		}
+		ls.requestsMap[key][time.Now()] = 1
+		// Check if threshold has been reached.
+		i := 0
+		for grantTime, _ := range ls.requestsMap[key] {
+			if time.Since(grantTime).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				delete(ls.requestsMap[key], grantTime)
+			} else {
+				i++
+				if i > storagerpc.QueryCacheThresh {
+					wantlease = true
+					break
+				}
+			}
+		}
+		ls.requestsMapLock.Unlock()
 	}
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
@@ -115,8 +184,13 @@ func (ls *libstore) Get(key string) (string, error) {
 	}
 	if reply.Status == storagerpc.OK {
 		result := reply.Value
-		if wantlease == true {
-			//TODO: Add reply.Lease into leaseMap?
+		if reply.Lease.Granted == true {
+			ls.ECacheMapLock.Lock()
+			ls.ECacheMap[key] = new(ECache)
+			ls.ECacheMap[key].value = reply.Value
+			ls.ECacheMap[key].timeGranted = time.Now()
+			ls.ECacheMap[key].validSecond = reply.Lease.ValidSeconds
+			ls.ECacheMapLock.Unlock()
 		}
 		return result, nil
 	} else if reply.Status == storagerpc.WrongServer {
@@ -156,13 +230,48 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if something in the cache
+	ls.LCacheMapLock.Lock()
+	cacheResult, ok := ls.LCacheMap[key]
+	ls.LCacheMapLock.Unlock()
+	if ok {
+		if time.Since(cacheResult.timeGranted).Seconds() > float64(cacheResult.validSecond) {
+			ls.LCacheMapLock.Lock()
+			delete(ls.LCacheMap, key)
+			ls.LCacheMapLock.Unlock()
+		} else {
+			return cacheResult.value, nil
+		}
+	}
+
 	wantlease := false
 	if ls.mode == Never {
 		wantlease = false
 	} else if ls.mode == Always {
 		wantlease = true
 	} else {
-		//TODO: Judge whether wantlease is true or false
+		// Put this request into listRequestsMap
+		ls.listRequestsMapLock.Lock()
+		_, ok := ls.listRequestsMap[key]
+		if !ok { //No such request before
+			ls.listRequestsMap[key] = make(map[time.Time]int)
+		}
+		ls.listRequestsMap[key][time.Now()] = 1
+		// Check if threshold has been reached.
+		i := 0
+		for grantTime, _ := range ls.listRequestsMap[key] {
+			if time.Since(grantTime).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				delete(ls.listRequestsMap[key], grantTime)
+			} else {
+				i++
+				if i > storagerpc.QueryCacheThresh {
+					wantlease = true
+					break
+				}
+			}
+		}
+		ls.listRequestsMapLock.Unlock()
 	}
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
@@ -173,8 +282,13 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	}
 	if reply.Status == storagerpc.OK {
 		result := reply.Value
-		if wantlease == true {
-			//TODO: Add reply.Lease into leaseMap?
+		if reply.Lease.Granted == true {
+			ls.LCacheMapLock.Lock()
+			ls.LCacheMap[key] = new(LCache)
+			ls.LCacheMap[key].value = reply.Value
+			ls.LCacheMap[key].timeGranted = time.Now()
+			ls.LCacheMap[key].validSecond = reply.Lease.ValidSeconds
+			ls.LCacheMapLock.Unlock()
 		}
 		return result, nil
 	} else if reply.Status == storagerpc.WrongServer {
@@ -231,14 +345,71 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
-	return errors.New("not implemented")
+	for {
+		ls.LCacheMapLock.Lock()
+		if _, ok := ls.LCacheMap[args.Key]; ok {
+			delete(ls.LCacheMap, args.Key)
+			reply.Status = storagerpc.OK
+			ls.LCacheMapLock.Unlock()
+			return nil
+		}
+		ls.LCacheMapLock.Unlock()
+		ls.ECacheMapLock.Lock()
+		if _, ok := ls.ECacheMap[args.Key]; ok {
+			delete(ls.ECacheMap, args.Key)
+			reply.Status = storagerpc.OK
+			ls.ECacheMapLock.Unlock()
+			return nil
+		}
+		ls.ECacheMapLock.Unlock()
+		reply.Status = storagerpc.OK
+		return nil
+	}
+}
+
+func (ls *libstore) cleaningLCache() {
+	for {
+		ls.LCacheMapLock.Lock()
+		cacheMap := ls.LCacheMap
+		ls.LCacheMapLock.Unlock()
+
+		for key, cache := range cacheMap {
+			if time.Since(cache.timeGranted).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				ls.LCacheMapLock.Lock()
+				delete(ls.LCacheMap, key)
+				ls.LCacheMapLock.Unlock()
+			}
+		}
+		time.Sleep(time.Duration(1) * time.Second)
+	}
+}
+
+func (ls *libstore) cleaningECache() {
+	for {
+		ls.ECacheMapLock.Lock()
+		cacheMap := ls.ECacheMap
+		ls.ECacheMapLock.Unlock()
+
+		for key, cache := range cacheMap {
+			if time.Since(cache.timeGranted).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				ls.ECacheMapLock.Lock()
+				delete(ls.ECacheMap, key)
+				ls.ECacheMapLock.Unlock()
+			}
+		}
+		time.Sleep(time.Duration(1) * time.Second)
+	}
 }
 
 func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
-	keyHash := StoreHash(key)
+	strs := strings.Split(key, ":")
+	userID := strs[0]
+	keyHash := StoreHash(userID)
 	serverHostPort := ""
-	var serverID uint32
+	var serverID, minID uint32
 	serverID = 1<<32 - 1
+	minID = 1<<32 - 1
+	minHostPort := ""
 	ls.serverListLock.Lock()
 	for e := ls.serverList.Front(); e != nil; e = e.Next() {
 		node := e.Value.(storagerpc.Node)
@@ -246,9 +417,13 @@ func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
 			serverID = node.NodeID
 			serverHostPort = node.HostPort
 		}
+		if minID > node.NodeID {
+			minID = node.NodeID
+			minHostPort = node.HostPort
+		}
 	}
-	if serverHostPort == "" {
-		serverHostPort = ls.serverList.Front().Value.(storagerpc.Node).HostPort
+	if serverID == 1<<32-1 {
+		serverHostPort = minHostPort
 	}
 	ls.serverListLock.Unlock()
 

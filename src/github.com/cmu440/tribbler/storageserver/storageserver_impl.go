@@ -62,7 +62,9 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		LleaseMap:            make(map[string]*list.List),
 		LleaseMapLock:        new(sync.Mutex),
 	}
+	isMaster := false
 	if srv.masterServerHostPort == "" {
+		isMaster = true
 		// run RPC server
 		srv.masterServerHostPort = "localhost:" + strconv.Itoa(port)
 		rpc.RegisterName("StorageServer", srv)
@@ -94,6 +96,18 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 			break
 		}
 		time.Sleep(time.Duration(1) * time.Second)
+	}
+
+	if !isMaster {
+		// run RPC server
+		srv.masterServerHostPort = "localhost:" + strconv.Itoa(port)
+		rpc.RegisterName("StorageServer", srv)
+		rpc.HandleHTTP()
+		l, err := net.Listen("tcp", ":"+strconv.Itoa(srv.port))
+		if err != nil {
+			return nil, err
+		}
+		go http.Serve(l, nil)
 	}
 	return srv, nil
 }
@@ -250,23 +264,6 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	reply.Value = slice
 	needGrant := false
 	if args.WantLease == true {
-		//fmt.Println("Grant a new lease for key", key)
-		//lease := new(storagerpc.Lease)
-		//lease.Granted = true
-		//lease.ValidSeconds = storagerpc.LeaseSeconds
-		//reply.Lease = *lease
-
-		//leaseinfo := new(leaseInfo)
-		//leaseinfo.GrantTime = time.Now()
-		//leaseinfo.HostPort = args.HostPort
-
-		//ss.LleaseMapLock.Lock()
-		//if _, ok := ss.LleaseMap[key]; !ok {
-		//	ss.LleaseMap[key] = list.New()
-		//}
-		//ss.LleaseMap[key].PushFront(leaseinfo)
-		//ss.LleaseMapLock.Unlock()
-		//return nil
 		ss.LleaseMapLock.Lock()
 		_, ok := ss.LleaseMap[key]
 		ss.LleaseMapLock.Unlock()
@@ -338,9 +335,17 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 			}
 			args := &storagerpc.RevokeLeaseArgs{key}
 			var reply *storagerpc.RevokeLeaseReply
-			for time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
-				go client.Call("LeaseCallbacks.RevokeLease", args, &reply)
-				time.Sleep(time.Duration(1) * time.Second)
+			if time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
+				replyChan := make(chan int, 1)
+				go func(replyChan chan int) {
+					client.Call("LeaseCallbacks.RevokeLease", args, &reply)
+					replyChan <- 1
+				}(replyChan)
+				select {
+				case <-replyChan:
+				case <-timeoutChan:
+				}
 			}
 		}
 		ss.EleaseMapLock.Lock()
@@ -462,7 +467,6 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 }
 
 func StoreHash(key string) uint32 {
-
 	strs := strings.Split(key, ":")
 	userID := strs[0]
 	hasher := fnv.New32()
@@ -477,6 +481,7 @@ func (ss *storageServer) validServer(keyHash uint32) bool {
 	for e := ss.serverList.Front(); e != nil; e = e.Next() {
 		node := e.Value.(storagerpc.Node)
 		if node.NodeID >= keyHash && node.NodeID < serverID {
+
 			serverID = node.NodeID
 		}
 		if minID > node.NodeID {
@@ -511,11 +516,18 @@ func (ss *storageServer) revokeKey(key string) {
 			}
 			args := &storagerpc.RevokeLeaseArgs{key}
 			var reply *storagerpc.RevokeLeaseReply
-			for time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
-				go client.Call("LeaseCallbacks.RevokeLease", args, &reply)
-				time.Sleep(time.Duration(1) * time.Second)
+			if time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
+				replyChan := make(chan int, 1)
+				go func(replyChan chan int) {
+					client.Call("LeaseCallbacks.RevokeLease", args, &reply)
+					replyChan <- 1
+				}(replyChan)
+				select {
+				case <-replyChan:
+				case <-timeoutChan:
+				}
 			}
-
 		}
 		ss.LleaseMapLock.Lock()
 		delete(ss.LleaseMap, key)
