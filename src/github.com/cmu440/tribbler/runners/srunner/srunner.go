@@ -11,12 +11,12 @@ import (
 	"github.com/cmu440/tribbler/storageserver"
 )
 
-const defaultMasterPort = 9010
+const defaultMasterPort = 9009
 
 var (
 	port           = flag.Int("port", defaultMasterPort, "port number to listen on")
-	masterHostPort = flag.String("master", "localhost:9009", "master storage server host port (if non-empty then this storage server is a slave)")
-	numNodes       = flag.Int("N", 2, "the number of nodes in the ring (including the master)")
+	masterHostPort = flag.String("master", "", "master storage server host port (if non-empty then this storage server is a slave)")
+	numNodes       = flag.Int("N", 1, "the number of nodes in the ring (including the master)")
 	nodeID         = flag.Uint("id", 0, "a 32-bit unsigned node ID to use for consistent hashing")
 )
 
