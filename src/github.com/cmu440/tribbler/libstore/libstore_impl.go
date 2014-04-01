@@ -10,7 +10,13 @@ import (
 	"sync"
 	"time"
 )
+
 // written by wayman tan
+const(
+	ItemExists = "item already exists"
+	ItemNotFound = "item not found"
+)
+
 type libstore struct {
 	mode                 LeaseMode
 	masterServerHostPort string
@@ -196,7 +202,7 @@ func (ls *libstore) Get(key string) (string, error) {
 	} else if reply.Status == storagerpc.WrongServer {
 		return "", errors.New("Wrong server")
 	} else if reply.Status == storagerpc.ItemNotFound {
-		return "", errors.New("Item Not Found")
+		return "", errors.New(ItemNotFound)
 	} else {
 		return "", errors.New("Fail to get " + key + "from storageserver")
 	}
@@ -207,6 +213,7 @@ func (ls *libstore) Put(key, value string) error {
 	if err != nil {
 		return err
 	}
+
 	args := &storagerpc.PutArgs{key, value}
 	var reply *storagerpc.PutReply
 	err = client.Call("StorageServer.Put", args, &reply)
@@ -218,7 +225,7 @@ func (ls *libstore) Put(key, value string) error {
 	} else if reply.Status == storagerpc.WrongServer {
 		return errors.New("Wrong server")
 	} else if reply.Status == storagerpc.ItemExists {
-		return errors.New("Item already exists")
+		return errors.New(ItemExists)
 	} else {
 		return errors.New("Fail to put " + key + "into storageserver")
 	}
@@ -294,7 +301,7 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	} else if reply.Status == storagerpc.WrongServer {
 		return nil, errors.New("Wrong server")
 	} else if reply.Status == storagerpc.ItemNotFound {
-		return nil, errors.New("Item Not Found")
+		return nil, errors.New(ItemNotFound)
 	} else {
 		return nil, errors.New("Fail to get " + key + " list from storageserver")
 	}
@@ -316,7 +323,7 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	} else if reply.Status == storagerpc.WrongServer {
 		return errors.New("Wrong server")
 	} else if reply.Status == storagerpc.ItemNotFound {
-		return errors.New("Item Not Found")
+		return errors.New(ItemNotFound)
 	} else {
 		return errors.New("Fail to remove " + key + "from storageserver")
 	}
@@ -338,7 +345,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	} else if reply.Status == storagerpc.WrongServer {
 		return errors.New("Wrong server")
 	} else if reply.Status == storagerpc.ItemExists {
-		return errors.New("Item already exists")
+		return errors.New(ItemExists)
 	} else {
 		return errors.New("Fail to append " + key + ":" + newItem + "into storageserver")
 	}

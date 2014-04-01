@@ -318,6 +318,14 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	}
 	value := args.Value
 
+	ss.elementMapLock.Lock()
+    	if _, ok := ss.elementMap[key]; ok {
+        	reply.Status = storagerpc.ItemExists
+        	ss.elementMapLock.Unlock()
+        	return nil
+    	}
+    	ss.elementMapLock.Unlock()
+
 	//Revoke all leases for this key
 	ss.EleaseMapLock.Lock()
 	l, ok := ss.EleaseMap[key]
@@ -538,7 +546,7 @@ func (ss *storageServer) revokeKey(key string) {
 
 func after(tribbleIDOne, tribbleIDTwo string) bool {
 	strOne := strings.Split(tribbleIDOne, ":")
-	strTwo := strings.Split(tribbleIDOne, ":")
+	strTwo := strings.Split(tribbleIDTwo, ":")
 	timeOne, _ := time.Parse(common.Layout, strOne[1])
 	timeTwo, _ := time.Parse(common.Layout, strTwo[1])
 	if timeOne.After(timeTwo) {
