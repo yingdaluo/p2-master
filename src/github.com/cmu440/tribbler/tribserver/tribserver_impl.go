@@ -5,12 +5,13 @@ import (
 	// "errors"
 	"github.com/cmu440/tribbler/libstore"
 	"github.com/cmu440/tribbler/rpc/tribrpc"
-	"github.com/cmu440/tribbler/common"
 	"net"
 	"net/http"
 	"net/rpc"
-	"time"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -57,14 +58,15 @@ func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) 
 }
 
 func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.CreateUserReply) error {
-	err := ts.libstore.Put(args.UserID, args.UserID)
-	if err != nil {
-		if err.Error() == libstore.ItemExists {
+	v, err := ts.libstore.Get(args.UserID)
+	if err == nil {
+		if v == args.UserID {
 			reply.Status = tribrpc.Exists
 			return nil
-		} 
-		return err	
+		}
 	}
+
+	ts.libstore.Put(args.UserID, args.UserID)
 	reply.Status = tribrpc.OK
 	return nil
 }
@@ -72,25 +74,28 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tribrpc.SubscriptionReply) error {
 	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
-		} 
-		return err	
+		}
+		return err
 	}
 
 	_, err = ts.libstore.Get(args.TargetUserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchTargetUser
 			return nil
-		} 
+		}
 		return err
 	}
 
 	err = ts.libstore.AppendToList(toSubscribeList(args.UserID), args.TargetUserID)
 	if err != nil {
-		return err
+		if err.Error() == libstore.ItemExists {
+			reply.Status = tribrpc.Exists
+			return nil
+		}
 	}
 	reply.Status = tribrpc.OK
 	return nil
@@ -99,43 +104,43 @@ func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tri
 func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *tribrpc.SubscriptionReply) error {
 	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
 		}
-		return err	
+		return err
 	}
 
-	_, err = ts.libstore.Get(args.TargetUserID)
+	//_, err = ts.libstore.Get(args.TargetUserID)
+	//if err != nil {
+	//	if err.Error() == libstore.KeyNotFound {
+	//		reply.Status = tribrpc.NoSuchTargetUser
+	//		return nil
+	//	}
+	//	return err
+	//}
+
+	err = ts.libstore.RemoveFromList(toSubscribeList(args.UserID), args.TargetUserID)
 	if err != nil {
 		if err.Error() == libstore.ItemNotFound {
 			reply.Status = tribrpc.NoSuchTargetUser
 			return nil
 		}
-		return err		
-	}
-
-	err = ts.libstore.RemoveFromList(toSubscribeList(args.UserID), args.TargetUserID)
-	if err != nil {
-		return err
 	}
 	reply.Status = tribrpc.OK
 	return nil
 }
 
 func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply *tribrpc.GetSubscriptionsReply) error {
-	_, err := ts.libstore.Get(args.UserID) 
+	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
 		}
-		return err		
-	}
-	subscriptionList, err := ts.libstore.GetList(toSubscribeList(args.UserID))
-	if err != nil {
 		return err
 	}
+	subscriptionList, _ := ts.libstore.GetList(toSubscribeList(args.UserID))
 	reply.Status = tribrpc.OK
 	reply.UserIDs = subscriptionList
 	return nil
@@ -144,11 +149,11 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.PostTribbleReply) error {
 	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
 		}
-		return err		
+		return err
 	}
 	time := time.Now()
 	tribble := new(tribrpc.Tribble)
@@ -160,19 +165,15 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	value, _ := json.Marshal(tribble)
 	newItem := string(value)
 
-	tribbleID := args.UserID + ":" + time.Format(common.Layout)
+	tribbleID := args.UserID + ":" + strconv.FormatInt(time.UnixNano(), 10)
 
 	// put the new tribble first
 	err = ts.libstore.Put(tribbleID, newItem)
 	if err != nil {
 		return err
 	}
-
 	// update the user's tribble list
-	err = ts.libstore.AppendToList(toTribbleList(args.UserID), tribbleID)
-	if err != nil {
-		return err
-	}
+	ts.libstore.AppendToList(toTribbleList(args.UserID), tribbleID)
 
 	reply.Status = tribrpc.OK
 	return nil
@@ -181,7 +182,7 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
 	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
 		}
@@ -189,11 +190,8 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 	}
 
 	// Get the tribble list of the user
-	tribbleList, err := ts.libstore.GetList(toTribbleList(args.UserID))
-	if err != nil {
-		return err
-	}
-	
+	tribbleList, _ := ts.libstore.GetList(toTribbleList(args.UserID))
+	sort.Sort(stringarr(tribbleList))
 	tribbles := make([]tribrpc.Tribble, TRIBBLE_LIMIT)
 
 	counter := 0
@@ -215,18 +213,15 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
 	_, err := ts.libstore.Get(args.UserID)
 	if err != nil {
-		if err.Error() == libstore.ItemNotFound {
+		if err.Error() == libstore.KeyNotFound {
 			reply.Status = tribrpc.NoSuchUser
 			return nil
 		}
-		return err
+		//return err
 	}
 
 	// Get the subscription list of the user
-	subList, err := ts.libstore.GetList(toSubscribeList(args.UserID))
-	if err != nil {
-		return err
-	}
+	subList, _ := ts.libstore.GetList(toSubscribeList(args.UserID))
 
 	subLen := len(subList)
 	subTribbleList := make([][]string, subLen)
@@ -235,14 +230,15 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	var tribbleList []string
 	for i := 0; i < subLen; i++ {
 		tribbleList, err = ts.libstore.GetList(toTribbleList(subList[i]))
+		sort.Sort(stringarr(tribbleList))
 		if err != nil {
 			// continue if there is no tribble list found for the subscribed user
-			if err.Error() == libstore.ItemNotFound {
+			if err.Error() == libstore.KeyNotFound {
 				continue
 			}
 			return err
-		}		
-		subTribbleList[i] = tribbleList		
+		}
+		subTribbleList[i] = tribbleList
 	}
 
 	// Get the latest 100 tribbles
@@ -310,11 +306,27 @@ func toTribbleList(userID string) string {
 func after(tribbleIDOne, tribbleIDTwo string) bool {
 	strOne := strings.Split(tribbleIDOne, ":")
 	strTwo := strings.Split(tribbleIDTwo, ":")
-	timeOne, _ := time.Parse(common.Layout, strOne[1])
-	timeTwo, _ := time.Parse(common.Layout, strTwo[1])
-	if timeOne.After(timeTwo) {
-		return true
-	} else {
-		return false
-	}
+	timeOne, _ := strconv.ParseInt(strOne[1], 10, 64)
+	timeTwo, _ := strconv.ParseInt(strTwo[1], 10, 64)
+
+	return timeOne > timeTwo
+}
+
+type stringarr []string
+
+func (a stringarr) Len() int {
+	return len(a)
+}
+func (a stringarr) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+	return
+}
+func (a stringarr) Less(i, j int) bool {
+	strOne := strings.Split(a[i], ":")
+	strTwo := strings.Split(a[j], ":")
+	timeOne, _ := strconv.ParseInt(strOne[1], 10, 64)
+	timeTwo, _ := strconv.ParseInt(strTwo[1], 10, 64)
+
+	return timeOne > timeTwo
+
 }

@@ -2,7 +2,6 @@ package storageserver
 
 import (
 	"container/list"
-	"github.com/cmu440/tribbler/common"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"hash/fnv"
 	"net"
@@ -31,6 +30,9 @@ type storageServer struct {
 
 	LleaseMap     map[string]*list.List
 	LleaseMapLock *sync.Mutex
+
+	connMap     map[string]*rpc.Client
+	connMapLock *sync.Mutex
 }
 
 type leaseInfo struct {
@@ -61,6 +63,8 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		EleaseMapLock:        new(sync.Mutex),
 		LleaseMap:            make(map[string]*list.List),
 		LleaseMapLock:        new(sync.Mutex),
+		connMap:              make(map[string]*rpc.Client),
+		connMapLock:          new(sync.Mutex),
 	}
 	isMaster := false
 	if srv.masterServerHostPort == "" {
@@ -249,7 +253,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	l, ok := ss.listMap[key]
 	ss.listMapLock.Unlock()
 	if !ok {
-		reply.Status = storagerpc.ItemNotFound
+		reply.Status = storagerpc.KeyNotFound
 		return nil
 	}
 
@@ -318,49 +322,8 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	}
 	value := args.Value
 
-	ss.elementMapLock.Lock()
-    	if _, ok := ss.elementMap[key]; ok {
-        	reply.Status = storagerpc.ItemExists
-        	ss.elementMapLock.Unlock()
-        	return nil
-    	}
-    	ss.elementMapLock.Unlock()
-
 	//Revoke all leases for this key
-	ss.EleaseMapLock.Lock()
-	l, ok := ss.EleaseMap[key]
-	ss.EleaseMapLock.Unlock()
-	if ok {
-		for e := l.Front(); e != nil; e = e.Next() {
-			leaseinfo := e.Value.(*leaseInfo)
-			if time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
-				continue
-			}
-			//Send revoke message and wait for reply.
-			client, err := rpc.DialHTTP("tcp", leaseinfo.HostPort)
-			if err != nil {
-				continue
-			}
-			args := &storagerpc.RevokeLeaseArgs{key}
-			var reply *storagerpc.RevokeLeaseReply
-			if time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
-				timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
-				replyChan := make(chan int, 1)
-				go func(replyChan chan int) {
-					client.Call("LeaseCallbacks.RevokeLease", args, &reply)
-					replyChan <- 1
-				}(replyChan)
-				select {
-				case <-replyChan:
-				case <-timeoutChan:
-				}
-			}
-		}
-		ss.EleaseMapLock.Lock()
-		delete(ss.EleaseMap, key)
-		ss.EleaseMapLock.Unlock()
-	}
-
+	ss.revokeElementKey(key)
 	ss.elementMapLock.Lock()
 	ss.elementMap[key] = value
 	ss.elementMapLock.Unlock()
@@ -377,68 +340,30 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 
 	//Revoke all leases for this key
 	ss.revokeKey(key)
-
-	suffix := strings.Split(key, ":")[1]
-	if suffix == "tribbleList" {
-		ss.listMapLock.Lock()
-		l, ok := ss.listMap[key]
-		ss.listMapLock.Unlock()
-		if ok { // There is already a list for that key
-			var value string
-			for e := l.Front(); e != nil; e = e.Next() {
-				value = e.Value.(string) // <User_id>:<Posted>
-				if value == args.Value {
-					reply.Status = storagerpc.ItemExists
-					return nil
-				}
-				if after(args.Value, value) { // A newer tribble
-					ss.listMapLock.Lock()
-					ss.listMap[key].InsertBefore(args.Value, e)
-					ss.listMapLock.Unlock()
-					reply.Status = storagerpc.OK
-					return nil
-				}
+	ss.listMapLock.Lock()
+	l, ok := ss.listMap[key]
+	ss.listMapLock.Unlock()
+	if ok { // There is already a list for that key
+		var value string
+		for e := l.Front(); e != nil; e = e.Next() {
+			value = e.Value.(string)
+			if value == args.Value {
+				reply.Status = storagerpc.ItemExists
+				return nil
 			}
-			//Oldest tribble should be put last of list
-			ss.listMapLock.Lock()
-			ss.listMap[key].PushBack(args.Value)
-			ss.listMapLock.Unlock()
-			reply.Status = storagerpc.OK
-			return nil
-		} else { // No key list exist before
-			ss.listMapLock.Lock()
-			ss.listMap[key] = list.New()
-			ss.listMap[key].PushFront(args.Value)
-			ss.listMapLock.Unlock()
-			reply.Status = storagerpc.OK
-			return nil
 		}
-	} else { // It's a request for subscriptions
 		ss.listMapLock.Lock()
-		l, ok := ss.listMap[key]
+		ss.listMap[key].PushFront(args.Value)
 		ss.listMapLock.Unlock()
-		if ok { // There is already a list for that key
-			var value string
-			for e := l.Front(); e != nil; e = e.Next() {
-				value = e.Value.(string)
-				if value == args.Value {
-					reply.Status = storagerpc.ItemExists
-					return nil
-				}
-			}
-			ss.listMapLock.Lock()
-			ss.listMap[key].PushFront(args.Value)
-			ss.listMapLock.Unlock()
-			reply.Status = storagerpc.OK
-			return nil
-		} else { // No key list exist before
-			ss.listMapLock.Lock()
-			ss.listMap[key] = list.New()
-			ss.listMap[key].PushFront(args.Value)
-			ss.listMapLock.Unlock()
-			reply.Status = storagerpc.OK
-			return nil
-		}
+		reply.Status = storagerpc.OK
+		return nil
+	} else { // No key list exist before
+		ss.listMapLock.Lock()
+		ss.listMap[key] = list.New()
+		ss.listMap[key].PushFront(args.Value)
+		ss.listMapLock.Unlock()
+		reply.Status = storagerpc.OK
+		return nil
 	}
 
 }
@@ -512,28 +437,44 @@ func (ss *storageServer) revokeKey(key string) {
 	l, ok := ss.LleaseMap[key]
 	ss.LleaseMapLock.Unlock()
 	if ok {
+		count := l.Len()
+		timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
+		replyChan := make(chan int, 1000)
 		for e := l.Front(); e != nil; e = e.Next() {
 			leaseinfo := e.Value.(*leaseInfo)
 			if time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				count--
 				continue
 			}
 			//Send revoke message and wait for reply.
-			client, err := rpc.DialHTTP("tcp", leaseinfo.HostPort)
+			client, err := ss.getRPCServer(leaseinfo.HostPort)
 			if err != nil {
+				count--
 				continue
 			}
 			args := &storagerpc.RevokeLeaseArgs{key}
 			var reply *storagerpc.RevokeLeaseReply
 			if time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
-				timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
-				replyChan := make(chan int, 1)
 				go func(replyChan chan int) {
 					client.Call("LeaseCallbacks.RevokeLease", args, &reply)
 					replyChan <- 1
 				}(replyChan)
+			} else {
+				count--
+				continue
+			}
+		}
+		if count > 0 {
+		L:
+			for {
 				select {
 				case <-replyChan:
+					count--
+					if count == 0 {
+						break L
+					}
 				case <-timeoutChan:
+					break L
 				}
 			}
 		}
@@ -541,17 +482,74 @@ func (ss *storageServer) revokeKey(key string) {
 		delete(ss.LleaseMap, key)
 		ss.LleaseMapLock.Unlock()
 	}
-
 }
 
-func after(tribbleIDOne, tribbleIDTwo string) bool {
-	strOne := strings.Split(tribbleIDOne, ":")
-	strTwo := strings.Split(tribbleIDTwo, ":")
-	timeOne, _ := time.Parse(common.Layout, strOne[1])
-	timeTwo, _ := time.Parse(common.Layout, strTwo[1])
-	if timeOne.After(timeTwo) {
-		return true
+func (ss *storageServer) revokeElementKey(key string) {
+	ss.EleaseMapLock.Lock()
+	l, ok := ss.EleaseMap[key]
+	ss.EleaseMapLock.Unlock()
+	if ok {
+		count := l.Len()
+		timeoutChan := time.After(time.Duration(float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds)) * time.Second)
+		replyChan := make(chan int, 1000)
+		for e := l.Front(); e != nil; e = e.Next() {
+			leaseinfo := e.Value.(*leaseInfo)
+			if time.Since(leaseinfo.GrantTime).Seconds() > float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				count--
+				continue
+			}
+			//Send revoke message and wait for reply.
+			client, err := ss.getRPCServer(leaseinfo.HostPort)
+			if err != nil {
+				count--
+				continue
+			}
+			args := &storagerpc.RevokeLeaseArgs{key}
+			var reply *storagerpc.RevokeLeaseReply
+			if time.Since(leaseinfo.GrantTime).Seconds() <= float64(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) {
+				go func(replyChan chan int) {
+					client.Call("LeaseCallbacks.RevokeLease", args, &reply)
+					replyChan <- 1
+				}(replyChan)
+			} else {
+				count--
+				continue
+			}
+		}
+
+		if count > 0 {
+		L:
+			for {
+				select {
+				case <-replyChan:
+					count--
+					if count == 0 {
+						break L
+					}
+				case <-timeoutChan:
+					break L
+				}
+			}
+		}
+		ss.EleaseMapLock.Lock()
+		delete(ss.EleaseMap, key)
+		ss.EleaseMapLock.Unlock()
+	}
+}
+
+func (ls *storageServer) getRPCServer(serverHostPort string) (*rpc.Client, error) {
+	ls.connMapLock.Lock()
+	if client, ok := ls.connMap[serverHostPort]; ok {
+		ls.connMapLock.Unlock()
+		return client, nil
 	} else {
-		return false
+		client, err := rpc.DialHTTP("tcp", serverHostPort)
+		if err != nil {
+			ls.connMapLock.Unlock()
+			return nil, err
+		}
+		ls.connMap[serverHostPort] = client
+		ls.connMapLock.Unlock()
+		return client, nil
 	}
 }

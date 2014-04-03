@@ -1,7 +1,6 @@
 package libstore
 
 import (
-	"container/list"
 	"errors"
 	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
@@ -12,8 +11,9 @@ import (
 )
 
 // written by wayman tan
-const(
-	ItemExists = "item already exists"
+const (
+	ItemExists   = "item already exists"
+	KeyNotFound  = "key not found"
 	ItemNotFound = "item not found"
 )
 
@@ -21,11 +21,9 @@ type libstore struct {
 	mode                 LeaseMode
 	masterServerHostPort string
 	myHostPort           string
-	serverList           *list.List
-	serverListLock       *sync.Mutex
+	serverList           []storagerpc.Node
 
 	connMap         map[string]*rpc.Client
-	connMapLock     *sync.Mutex
 	requestsMap     map[string]map[time.Time]int
 	requestsMapLock *sync.Mutex
 
@@ -78,10 +76,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		mode:                 mode,
 		masterServerHostPort: masterServerHostPort,
 		myHostPort:           myHostPort,
-		serverList:           list.New(),
-		serverListLock:       new(sync.Mutex),
 		connMap:              make(map[string]*rpc.Client),
-		connMapLock:          new(sync.Mutex),
 
 		requestsMap:         make(map[string]map[time.Time]int),
 		requestsMapLock:     new(sync.Mutex),
@@ -107,14 +102,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 			return nil, err
 		}
 		if reply.Status == storagerpc.OK {
-			ls.serverListLock.Lock()
-			for _, node := range reply.Servers {
-				ls.serverList.PushBack(node)
-			}
-			ls.serverListLock.Unlock()
-			ls.connMapLock.Lock()
-			ls.connMap[masterServerHostPort] = client
-			ls.connMapLock.Unlock()
+			ls.serverList = reply.Servers
 			break
 		} else {
 			time.Sleep(time.Duration(1) * time.Second)
@@ -123,6 +111,14 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 
 	if i >= 5 {
 		return nil, errors.New("Fail to connect storage server")
+	}
+
+	for _, server := range ls.serverList {
+		client, err := rpc.DialHTTP("tcp", server.HostPort)
+		if err != nil {
+			return nil, err
+		}
+		ls.connMap[server.HostPort] = client
 	}
 	if mode != Never {
 		rpc.RegisterName("LeaseCallbacks", librpc.Wrap(ls))
@@ -139,14 +135,14 @@ func (ls *libstore) Get(key string) (string, error) {
 	}
 
 	// Check if something in the cache
-	ls.ECacheMapLock.Lock()
+	//ls.ECacheMapLock.Lock()
 	cacheResult, ok := ls.ECacheMap[key]
-	ls.ECacheMapLock.Unlock()
+	//ls.ECacheMapLock.Unlock()
 	if ok {
 		if time.Since(cacheResult.timeGranted).Seconds() > float64(cacheResult.validSecond) {
-			ls.ECacheMapLock.Lock()
+			//ls.ECacheMapLock.Lock()
 			delete(ls.ECacheMap, key)
-			ls.ECacheMapLock.Unlock()
+			//ls.ECacheMapLock.Unlock()
 		} else {
 			return cacheResult.value, nil
 		}
@@ -160,17 +156,21 @@ func (ls *libstore) Get(key string) (string, error) {
 		wantlease = true
 	} else {
 		// Put this request into requestsMap
-		ls.requestsMapLock.Lock()
+		//ls.requestsMapLock.Lock()
 		_, ok := ls.requestsMap[key]
 		if !ok { //No such request before
 			ls.requestsMap[key] = make(map[time.Time]int)
 		}
 		ls.requestsMap[key][time.Now()] = 1
+		queryMap := ls.requestsMap[key]
+		//ls.requestsMapLock.Unlock()
 		// Check if threshold has been reached.
 		i := 0
-		for grantTime, _ := range ls.requestsMap[key] {
+		for grantTime, _ := range queryMap {
 			if time.Since(grantTime).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				//ls.requestsMapLock.Lock()
 				delete(ls.requestsMap[key], grantTime)
+				//ls.requestsMapLock.Unlock()
 			} else {
 				i++
 				if i > storagerpc.QueryCacheThresh {
@@ -179,7 +179,6 @@ func (ls *libstore) Get(key string) (string, error) {
 				}
 			}
 		}
-		ls.requestsMapLock.Unlock()
 	}
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
@@ -191,18 +190,18 @@ func (ls *libstore) Get(key string) (string, error) {
 	if reply.Status == storagerpc.OK {
 		result := reply.Value
 		if reply.Lease.Granted == true {
-			ls.ECacheMapLock.Lock()
+			//ls.ECacheMapLock.Lock()
 			ls.ECacheMap[key] = new(ECache)
 			ls.ECacheMap[key].value = reply.Value
 			ls.ECacheMap[key].timeGranted = time.Now()
 			ls.ECacheMap[key].validSecond = reply.Lease.ValidSeconds
-			ls.ECacheMapLock.Unlock()
+			//ls.ECacheMapLock.Unlock()
 		}
 		return result, nil
 	} else if reply.Status == storagerpc.WrongServer {
 		return "", errors.New("Wrong server")
-	} else if reply.Status == storagerpc.ItemNotFound {
-		return "", errors.New(ItemNotFound)
+	} else if reply.Status == storagerpc.KeyNotFound {
+		return "", errors.New(KeyNotFound)
 	} else {
 		return "", errors.New("Fail to get " + key + "from storageserver")
 	}
@@ -213,7 +212,6 @@ func (ls *libstore) Put(key, value string) error {
 	if err != nil {
 		return err
 	}
-
 	args := &storagerpc.PutArgs{key, value}
 	var reply *storagerpc.PutReply
 	err = client.Call("StorageServer.Put", args, &reply)
@@ -239,14 +237,12 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	}
 
 	// Check if something in the cache
-	ls.LCacheMapLock.Lock()
 	cacheResult, ok := ls.LCacheMap[key]
-	ls.LCacheMapLock.Unlock()
 	if ok {
 		if time.Since(cacheResult.timeGranted).Seconds() > float64(cacheResult.validSecond) {
-			ls.LCacheMapLock.Lock()
+			//ls.LCacheMapLock.Lock()
 			delete(ls.LCacheMap, key)
-			ls.LCacheMapLock.Unlock()
+			//ls.LCacheMapLock.Unlock()
 		} else {
 			return cacheResult.value, nil
 		}
@@ -259,17 +255,21 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 		wantlease = true
 	} else {
 		// Put this request into listRequestsMap
-		ls.listRequestsMapLock.Lock()
+		//ls.listRequestsMapLock.Lock()
 		_, ok := ls.listRequestsMap[key]
 		if !ok { //No such request before
 			ls.listRequestsMap[key] = make(map[time.Time]int)
 		}
 		ls.listRequestsMap[key][time.Now()] = 1
+		queryMap := ls.listRequestsMap[key]
+		//ls.listRequestsMapLock.Unlock()
 		// Check if threshold has been reached.
 		i := 0
-		for grantTime, _ := range ls.listRequestsMap[key] {
+		for grantTime, _ := range queryMap {
 			if time.Since(grantTime).Seconds() > float64(storagerpc.QueryCacheSeconds) {
+				//ls.listRequestsMapLock.Lock()
 				delete(ls.listRequestsMap[key], grantTime)
+				//ls.listRequestsMapLock.Unlock()
 			} else {
 				i++
 				if i > storagerpc.QueryCacheThresh {
@@ -278,7 +278,6 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 				}
 			}
 		}
-		ls.listRequestsMapLock.Unlock()
 	}
 
 	args := &storagerpc.GetArgs{key, wantlease, ls.myHostPort}
@@ -290,18 +289,18 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	if reply.Status == storagerpc.OK {
 		result := reply.Value
 		if reply.Lease.Granted == true {
-			ls.LCacheMapLock.Lock()
+			//ls.LCacheMapLock.Lock()
 			ls.LCacheMap[key] = new(LCache)
 			ls.LCacheMap[key].value = reply.Value
 			ls.LCacheMap[key].timeGranted = time.Now()
 			ls.LCacheMap[key].validSecond = reply.Lease.ValidSeconds
-			ls.LCacheMapLock.Unlock()
+			//ls.LCacheMapLock.Unlock()
 		}
 		return result, nil
 	} else if reply.Status == storagerpc.WrongServer {
 		return nil, errors.New("Wrong server")
-	} else if reply.Status == storagerpc.ItemNotFound {
-		return nil, errors.New(ItemNotFound)
+	} else if reply.Status == storagerpc.KeyNotFound {
+		return nil, errors.New(KeyNotFound)
 	} else {
 		return nil, errors.New("Fail to get " + key + " list from storageserver")
 	}
@@ -340,6 +339,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	if err != nil {
 		return err
 	}
+
 	if reply.Status == storagerpc.OK {
 		return nil
 	} else if reply.Status == storagerpc.WrongServer {
@@ -353,22 +353,22 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
 	for {
-		ls.LCacheMapLock.Lock()
+		//ls.LCacheMapLock.Lock()
 		if _, ok := ls.LCacheMap[args.Key]; ok {
 			delete(ls.LCacheMap, args.Key)
 			reply.Status = storagerpc.OK
-			ls.LCacheMapLock.Unlock()
+			//ls.LCacheMapLock.Unlock()
 			return nil
 		}
-		ls.LCacheMapLock.Unlock()
-		ls.ECacheMapLock.Lock()
+		//ls.LCacheMapLock.Unlock()
+		//ls.ECacheMapLock.Lock()
 		if _, ok := ls.ECacheMap[args.Key]; ok {
 			delete(ls.ECacheMap, args.Key)
 			reply.Status = storagerpc.OK
-			ls.ECacheMapLock.Unlock()
+			//ls.ECacheMapLock.Unlock()
 			return nil
 		}
-		ls.ECacheMapLock.Unlock()
+		//ls.ECacheMapLock.Unlock()
 		reply.Status = storagerpc.OK
 		return nil
 	}
@@ -376,15 +376,15 @@ func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storage
 
 func (ls *libstore) cleaningLCache() {
 	for {
-		ls.LCacheMapLock.Lock()
+		//ls.LCacheMapLock.Lock()
 		cacheMap := ls.LCacheMap
-		ls.LCacheMapLock.Unlock()
+		//ls.LCacheMapLock.Unlock()
 
 		for key, cache := range cacheMap {
 			if time.Since(cache.timeGranted).Seconds() > float64(storagerpc.QueryCacheSeconds) {
-				ls.LCacheMapLock.Lock()
+				//ls.LCacheMapLock.Lock()
 				delete(ls.LCacheMap, key)
-				ls.LCacheMapLock.Unlock()
+				//ls.LCacheMapLock.Unlock()
 			}
 		}
 		time.Sleep(time.Duration(1) * time.Second)
@@ -393,15 +393,15 @@ func (ls *libstore) cleaningLCache() {
 
 func (ls *libstore) cleaningECache() {
 	for {
-		ls.ECacheMapLock.Lock()
+		//ls.ECacheMapLock.Lock()
 		cacheMap := ls.ECacheMap
-		ls.ECacheMapLock.Unlock()
+		//ls.ECacheMapLock.Unlock()
 
 		for key, cache := range cacheMap {
 			if time.Since(cache.timeGranted).Seconds() > float64(storagerpc.QueryCacheSeconds) {
-				ls.ECacheMapLock.Lock()
+				//ls.ECacheMapLock.Lock()
 				delete(ls.ECacheMap, key)
-				ls.ECacheMapLock.Unlock()
+				//ls.ECacheMapLock.Unlock()
 			}
 		}
 		time.Sleep(time.Duration(1) * time.Second)
@@ -417,9 +417,7 @@ func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
 	serverID = 1<<32 - 1
 	minID = 1<<32 - 1
 	minHostPort := ""
-	ls.serverListLock.Lock()
-	for e := ls.serverList.Front(); e != nil; e = e.Next() {
-		node := e.Value.(storagerpc.Node)
+	for _, node := range ls.serverList {
 		if node.NodeID >= keyHash && node.NodeID < serverID {
 			serverID = node.NodeID
 			serverHostPort = node.HostPort
@@ -432,20 +430,7 @@ func (ls *libstore) getRPCServer(key string) (*rpc.Client, error) {
 	if serverID == 1<<32-1 {
 		serverHostPort = minHostPort
 	}
-	ls.serverListLock.Unlock()
 
-	ls.connMapLock.Lock()
-	if client, ok := ls.connMap[serverHostPort]; ok {
-		ls.connMapLock.Unlock()
-		return client, nil
-	} else {
-		client, err := rpc.DialHTTP("tcp", serverHostPort)
-		if err != nil {
-			ls.connMapLock.Unlock()
-			return nil, err
-		}
-		ls.connMap[serverHostPort] = client
-		return client, nil
-	}
+	return ls.connMap[serverHostPort], nil
 
 }

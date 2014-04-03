@@ -68,13 +68,13 @@ func main() {
 		LOGE.Fatalf("FAIL: numTargets invalid %s\n", flag.Arg(1))
 	}
 
-	status, err := client.CreateUser(user)
+	_, err = client.CreateUser(user)
 	if err != nil {
 		LOGE.Fatalf("FAIL: error when creating userID '%s': %s\n", user, err)
 	}
-	if status != tribrpc.OK {
-		LOGE.Fatalln("FAIL: CreateUser returned error status", statusMap[status])
-	}
+	//if status != tribrpc.OK {
+	//	LOGE.Fatalln("FAIL: CreateUser returned error status", statusMap[status])
+	//}
 
 	tribIndex := 0
 	if *seed == 0 {
